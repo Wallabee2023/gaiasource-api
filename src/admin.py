@@ -27,6 +27,9 @@ from config import *
 import json
 import time
 import logging
+#import multiprocessing as mp
+from util import *
+import functools
 
 # Set up logging
 logging.basicConfig(
@@ -39,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def get_db_connection(db_name):
+def get_db_connection(db_name, verbose=False):
     """Create and return a MySQL connection."""
     connection = None
     try:
@@ -49,10 +52,11 @@ def get_db_connection(db_name):
             password=ADMIN_PASSWORD,
             database=db_name
         )
-        if connection.is_connected():
+        if connection.is_connected() and verbose:
             logger.info("Connection to MySQL DB successful")
     except Error as e:
-        logger.error(f"Error connecting to MySQL DB: {e}")
+        if verbose:
+            logger.error(f"Error connecting to MySQL DB: {e}")
     return connection
 
 def add_data(connection, table, data, verbose=False):
@@ -86,31 +90,20 @@ def query_data(connection, table):
     finally:
         cursor.close()
 
-def query_data_batch(connection, table_name, limit, start_id):
-    """Query data in batches from the specified table starting after start_id."""
+def query_batch(table_name, limit, start_id, db_path):
+    """Query a batch of data from the database."""
+    connection = get_db_connection(GAIA_DATABASE_NAME)
     cursor = connection.cursor()
-    
-    # Ensure start_id is an integer
-    if start_id is not None:
-        try:
-            start_id = int(start_id)  # Convert to integer if possible
-            query = f"SELECT * FROM {table_name} WHERE id > {start_id} ORDER BY id LIMIT {limit}"
-        except ValueError:
-            logger.error(f"Invalid start_id value: {start_id}; must be an integer.")
-            return None, None  # Handle the error gracefully
-    else:
-        query = f"SELECT * FROM {table_name} ORDER BY id LIMIT {limit}"
 
+    query = f"SELECT * FROM {table_name} WHERE id > {start_id} ORDER BY id LIMIT {limit}"
     cursor.execute(query)
-    rows = cursor.fetchmany(limit)  # Fetch in chunks
-    if not rows:
-        return None, start_id
+    rows = cursor.fetchmany(limit)
 
-    # Update start_id to the last fetched row's id for the next batch
-    start_id = rows[-1][-1] if rows else start_id
+    # Close the connection after use
+    connection.close()
 
     # Convert rows to JSON format
-    return json.dumps({'results': [list(row) for row in rows]}), start_id
+    return rows, start_id
 
 def test_connection(db_name, table):
     """Test the database connection and perform a sample read operation."""
@@ -150,6 +143,19 @@ def get_total_row_count(connection, table_name):
     cursor.close()
     return total_rows
 
+def get_min_max_ids(table_name):
+    connection = get_db_connection("gaia")
+    cursor = connection.cursor()
+    
+    query = f"SELECT MIN(id), MAX(id) FROM {table_name}"
+    cursor.execute(query)
+    
+    min_id, max_id = cursor.fetchone()
+    
+    connection.close()
+    
+    return min_id, max_id
+
 def get_database_diagnostics(start_time):
     """Get diagnostics data including the number of entries, database size, and server uptime."""
     connection = get_db_connection(GAIA_DATABASE_NAME)
@@ -187,7 +193,13 @@ def get_database_diagnostics(start_time):
 
 def main():
     """Run the test connection function."""
-    test_connection("gaia", "GaiaData")
+    #test_connection("gaia", "GaiaData")
+    #connection=get_db_connection("gaia")
+    #for batch, start_id in query_data_generator(connection, 'GaiaData', 100000, 0):
+    #    print(start_id)
+    #process(6, [0,0,0])
+    query_data_multiprocessing_generator([4500000,25000000])
+
 
 if __name__ == "__main__":
     main()

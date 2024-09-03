@@ -10,6 +10,9 @@ from config import *
 import json
 from tqdm import tqdm
 from PyAstronomy import pyasl
+import multiprocessing as mp
+import numba
+from numba.typed import Dict
 
 def spherical_to_cartesian(ra, dec, dist):
 	# Convert angles from degrees to radians
@@ -254,7 +257,7 @@ def adjust_gamma(RGB):
     RGB[~mask] = (1 + a) * RGB[~mask]**(1 / 2.4) - a
     return RGB
 
-def precompute_colors(temp_range, step=1, filename=COLOR_LOOKUP_TABLE_PATH):
+def precompute_colors(temp_range, step=COLOR_TEMPERATURE_COARSENESS, filename=COLOR_LOOKUP_TABLE_PATH):
     """
     Precompute RGB colors for a range of temperatures and save to a JSON file.
     
@@ -280,6 +283,8 @@ def precompute_colors(temp_range, step=1, filename=COLOR_LOOKUP_TABLE_PATH):
         json.dump(colors, file, indent=4)
     
     print(f"Lookup table saved to {filename}")
+
+#precompute_colors((1000,50000))
 
 def load_color_lookup_table(filename=COLOR_LOOKUP_TABLE_PATH):
     """
@@ -321,7 +326,7 @@ def process_temperatures(temp_array, lookup_table):
     # Ensure temperatures are integers for lookup
     temp_array = np.nan_to_num(temp_array, nan=6000)
     temp_array = np.round(temp_array).astype(int)
-    rounded_temps = np.round(temp_array / 10) * 10
+    rounded_temps = np.round(temp_array / COLOR_TEMPERATURE_COARSENESS) * COLOR_TEMPERATURE_COARSENESS
 
     # Initialize RGB array
     rgb_array = np.zeros((len(rounded_temps), 3))
@@ -331,7 +336,7 @@ def process_temperatures(temp_array, lookup_table):
         if temp in lookup_table:
             rgb_array[i] = lookup_table[temp]
         else:
-            rgb_array[i] = [0, 0, 0]  # Default color (black) if temperature is not in lookup table
+            rgb_array[i] = [0, 255, 0]  # Default color (red) if temperature is not in lookup table
     
     return (rgb_array*255).astype(int)
 
@@ -358,7 +363,7 @@ def rgb_to_hex(rgb):
     return hex_colors
 
 # Convert the NumPy array to a list of dictionaries
-def convert_array_to_json(data_array):
+def convert_array_to_dict(data_array):
     # Define column names
     columns = ['GaiaID', 'x', 'y', 'z', 'hex_color', 'magnitude']
     
@@ -367,72 +372,97 @@ def convert_array_to_json(data_array):
         dict(zip(columns, row)) for row in data_array
     ]
     
-    # Convert list of dictionaries to JSON
-    json_object = json.dumps(list_of_dicts, indent=4)
+    return list_of_dicts
+
+@numba.njit()
+def process_rows(rows, exoplanet_coords, visual_magnitude_cutoff, lookup):
     
-    return json_object
+    matrix = np.array(rows).T
+    coordinates = matrix[1:4, :].astype(np.float32)
+    temperatures = matrix[4, :].astype(np.float32)
+    visual_magnitudes = matrix[5, :].astype(np.float32)
 
-def process(visual_magnitude_cutoff, exoplanet_coords):
-    # Load color lookup table
-    lookup = load_color_lookup_table()
+    #print("Parsed out components")
 
-    # Establish a connection to the database
+    # Compute all distances from exoplanet to the stars
+    delta = coordinates - exoplanet_coords[:, np.newaxis]
+    dist_ex = np.linalg.norm(delta, axis=0)
+
+    # Compute all distances from exoplanet to the stars
+    dist = np.linalg.norm(coordinates, axis=0)
+
+    #print("Computed Distances...")
+
+    # Compute relative magnitudes
+    relative_magnitudes = visual_magnitudes + 5 * np.log10(dist_ex / dist)
+
+    # Filter stars based on visual magnitude cutoff
+    mask = relative_magnitudes < visual_magnitude_cutoff
+    batch_star_list = matrix[:, mask]
+
+    batch_star_list[1:4] = delta[:, mask]
+    batch_star_list[5] = relative_magnitudes[mask]
+
+    #print("Filtered stars...")
+
+    # Check if temperatures array is not empty
+    if temperatures[mask].size > 0:
+        rgb_colors = process_temperatures(temperatures[mask], lookup)
+        batch_star_list[4] = rgb_to_hex(rgb_colors)
+    else:
+        batch_star_list[4] = np.array([])  # Or handle as needed
+
+    return convert_array_to_dict(batch_star_list.T)
+
+def query_data_multiprocessing_generator(id_min, id_max, lookup, exoplanet_coords, visual_magnitude_cutoff):
+    """Main function to manage multiprocessing of database queries"""
+    num_rows = id_max - id_min
+    n_workers = 4
+
+
+    # Number of batches, rounded up
+    n_batches = num_rows // BATCH_SIZE + (num_rows % BATCH_SIZE > 0)
+
+    #print(id_max, id_min, n_batches)
+
+    # Create a queue of batches to be processed
+    batch_queue = [i * BATCH_SIZE + id_min for i in range(n_batches)]
+
+    # Create a pool of n_workers processes
+    with mp.Pool(n_workers) as pool:
+        for result in pool.imap(
+            functools.partial(worker, lookup=lookup, exoplanet_coords=exoplanet_coords, visual_magnitude_cutoff=visual_magnitude_cutoff), 
+            batch_queue):
+
+            if result:
+                yield json.dumps(result) + '\n'
+
+def worker(start_id, lookup, exoplanet_coords, visual_magnitude_cutoff):
+    """Query a batch of data from the database."""
     connection = get_db_connection(GAIA_DATABASE_NAME)
+    cursor = connection.cursor()
 
-    batch_size = 100000  # Adjust this size based on your memory constraints
-    start_id = 0  # Initial start_id as an integer
-    final_star_list = []
+    query = f"SELECT * FROM {GAIA_TABLE_NAME} WHERE id > {start_id} LIMIT {BATCH_SIZE}"
+    cursor.execute(query)
+    rows = cursor.fetchmany(BATCH_SIZE)
 
-    # Get total row count for the progress bar
-    total_rows = get_total_row_count(connection, GAIA_TABLE_NAME)
-    with tqdm(total=total_rows, desc="Processing", unit=" rows") as pbar:
-        while True:
-            # Query a batch of data from the database
-            response, start_id = query_data_batch(connection, GAIA_TABLE_NAME, batch_size, start_id)
-            if not response:
-                break
+    # Close the connection after use
+    connection.close()
 
-            rows = json.loads(response)['results']
-            if not rows:
-                break
+    # After the rows are fetched, we now process them
 
-            matrix = np.array(rows).T
-            coordinates = matrix[1:4, :].astype(np.float32)
-            temperatures = matrix[4, :].astype(np.float32)
-            visual_magnitudes = matrix[5, :].astype(np.float32)
+    # If the database query for the range of IDs returns an empty list, we can just terminate early
+    if len(rows) == 0:
+        return None
 
-            # Compute all distances from exoplanet to the stars
-            delta = coordinates - exoplanet_coords[:, np.newaxis]
-            dist_ex = np.linalg.norm(delta, axis=0)
+    star_list = process_rows(rows, exoplanet_coords, visual_magnitude_cutoff, lookup)
 
-            # Compute all distances from exoplanet to the stars
-            dist = np.linalg.norm(coordinates, axis=0)
+    # Return the processed rows
 
-            # Compute relative magnitudes
-            relative_magnitudes = visual_magnitudes + 5 * np.log10(dist_ex / dist)
+    if len(star_list) == 0:
+        return None
 
-            # Filter stars based on visual magnitude cutoff
-            mask = relative_magnitudes < visual_magnitude_cutoff
-            batch_star_list = matrix[:, mask]
-            if batch_star_list.size == 0:
-                continue  # Skip empty batch
-
-            batch_star_list[1:4] = delta[:, mask]
-            batch_star_list[5] = relative_magnitudes[mask]
-
-            # Check if temperatures array is not empty
-            if temperatures[mask].size > 0:
-                rgb_colors = process_temperatures(temperatures[mask], lookup)
-                batch_star_list[4] = rgb_to_hex(rgb_colors)
-            else:
-                batch_star_list[4] = np.array([])  # Or handle as needed
-
-            final_star_list.extend(batch_star_list.T.tolist())
-
-            # Update progress bar with the number of rows processed
-            pbar.update(len(rows)) 
-
-    return convert_array_to_json(np.array(final_star_list))
+    return star_list
 
 def fetch_exoplanet_position(pl_name):
     try:
@@ -450,3 +480,6 @@ def fetch_exoplanet_position(pl_name):
         return [x, y, z], 0
     except Exception as e:
         return -1, e
+
+if __name__ == "__main__":
+    process(6,np.array([0,0,0]))

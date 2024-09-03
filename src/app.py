@@ -1,4 +1,5 @@
-from flask import Flask, request, Response, stream_with_context, jsonify, abort
+from flask import Flask, request, Response, stream_with_context, jsonify, abort, render_template_string
+from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 import mysql.connector
 from mysql.connector import Error
@@ -6,15 +7,17 @@ from config import *
 from util import *
 import logging
 import time
+import csv
 
 # Record the start time when the program starts
 start_time = time.time()
 
 app = Flask(__name__)
+cors = CORS(app)
 
 # Set up logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.ERROR,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(f'{LOG_PATH}/app.log'),  # Log messages to 'app.log'
@@ -34,6 +37,8 @@ def check_host():
         abort(403)
     logger.info(f"Accepted request from: {request.host}")
 
+    print(f"Connection recieved from: {request.remote_addr}")
+
 def get_db_connection(db_name):
     """Create and return a MySQL connection."""
     try:
@@ -48,6 +53,8 @@ def get_db_connection(db_name):
         logger.error(f"Error connecting to database: {str(e)}")
         raise
 
+'''
+# Depreceated API function
 @app.route('/stars', methods=['GET'])
 def get_stars():
     """Fetch star data from the database with pagination."""
@@ -77,10 +84,7 @@ def get_stars():
         total_pages = (total_records + per_page - 1) // per_page
 
         response = {
-            "page": page,
-            "per_page": per_page,
-            "total_records": total_records,
-            "total_pages": total_pages,
+            "pagination": {"page": page, "per_page": per_page, "total_records": total_records, "total_pages": total_pages},
             "data": stars
         }
         return jsonify(response)
@@ -92,7 +96,7 @@ def get_stars():
     finally:
         if conn:
             conn.close()
-
+'''
 @app.route('/visible_stars', methods=['POST'])
 def process_data():
     """Process star data based on input JSON and return results."""
@@ -111,8 +115,13 @@ def process_data():
         visual_magnitude_cutoff = data.get('visual_magnitude_cutoff')
         exoplanet_cartesian_coordinates = np.array(data.get('exoplanet_cartesian_coordinates'))
 
+        # Load color lookup table
+        lookup = load_color_lookup_table()
+
+        id_min, id_max = get_min_max_ids('GaiaData')
+
         # Process and stream the result
-        return Response(stream_with_context(process(visual_magnitude_cutoff, exoplanet_cartesian_coordinates)),
+        return Response(stream_with_context(query_data_multiprocessing_generator(id_min, id_max, lookup, exoplanet_cartesian_coordinates, visual_magnitude_cutoff)),
                         content_type='application/json')
 
     except Exception as e:
@@ -134,14 +143,16 @@ def exoplanet_position(name):
     JSON
         A JSON response containing the x, y, z coordinates of the exoplanet.
     """
-    position_list, _ = fetch_exoplanet_position(name)
+    if name == "Earth":
+        return jsonify({"exoplanet": "Earth", "position": {"x": 0, "y": 0, "z": 0}})
 
-    # Catch an error
+    position_list, error_message = fetch_exoplanet_position(name)
+
     if position_list == -1:
-        return jsonify({"exoplanet": name, "error": f"{_}"})
+        app.logger.error(f"Error retrieving position for {name}: {error_message}")
+        return jsonify({"exoplanet": name, "error": f"{error_message}"}), 404
 
-    # Return the position data as a JSON response
-    return jsonify({"exoplanet": name, "position": dict(zip(["x","y","z"],position_list))})
+    return jsonify({"exoplanet": name, "position": dict(zip(["x", "y", "z"], position_list))})
 
 @app.route('/diagnostics', methods=['GET'])
 def diagnostics():

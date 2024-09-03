@@ -166,15 +166,32 @@ def insert_data(connection, data_batch):
     finally:
         cursor.close()
 
+def autoPopulate(gaia_names_path):
+    filenames = []
+    
+    # Open the file for reading
+    with open(gaia_names_path, 'r') as file:
+        for line in file:
+            # Strip any leading/trailing whitespace and split by spaces
+            parts = line.strip().split()
+            
+            # The filename is the last part of the line
+            if len(parts) > 1:
+                filenames.append(parts[-1])
+
+    for FILENAME in filenames:
+        FILENAME = FILENAME[:-3]
+        print(f"Installing {FILENAME}")
+        # For each gaia data file:
+        install_gaia_data(FILENAME)
+        append_gaiadata(f'./data/{FILENAME}')
+
+        # Delete old csv
+        os.remove(f'./data/{FILENAME}')
+
+
 def main():
-    FILENAME="GaiaSource_016241-017018.csv"
-
-    # For each gaia data file:
-    install_gaia_data(FILENAME)
-    append_gaiadata(f'./data/{FILENAME}')
-
-    # Delete old csv
-    os.remove(f'./data/{FILENAME}')
+    autoPopulate('./data/gaia_names.txt')
 
 if __name__ == "__main__":
 	main()
