@@ -1,3 +1,4 @@
+#optimised version
 import numpy as np
 import math
 from scipy.integrate import simpson
